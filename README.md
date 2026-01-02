@@ -14,6 +14,17 @@ around CT DICOM images and supports fixed low/high frequency quantization.
 - `build_medical_huffman_table.py`: build a fixed Huffman table from dataset.
 - `readdcm.py`: DICOM reading and windowed display utilities.
 
+## Compression Pipeline
+
+1. Read DICOM pixel data.
+2. Optional level shift (default: `2^(B-1)`).
+3. 8x8 block DCT.
+4. Low/high frequency quantization (Qlow/Qhigh).
+5. Zigzag scan.
+6. DC DPCM + AC RLE.
+7. Entropy coding (fixed medical table or adaptive).
+8. Write header + bitstream (`.mic`).
+
 ## Quick Start
 
 ### Encode / Decode (single file)
