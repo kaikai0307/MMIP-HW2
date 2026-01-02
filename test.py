@@ -1,12 +1,14 @@
 import argparse
 import csv
 import os
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from codec import test_codec_mvp
 from decode import compute_rmse_psnr, load_compressed_file
+from entropy_coding import EntropyCoder
 from readdcm import analyze_dicom_file, to_hu, window_image
 
 
@@ -31,11 +33,17 @@ def run_experiment(
     out_dir,
     window_center,
     window_width,
+    entropy_method,
+    level_shift_mode,
 ):
+    entropy_method = EntropyCoder.normalize_method(entropy_method)
+    if os.path.basename(out_dir) != entropy_method:
+        out_dir = os.path.join(out_dir, entropy_method)
     os.makedirs(out_dir, exist_ok=True)
 
     raw_img, header = analyze_dicom_file(dicom_path)
     bit_depth = getattr(header, "BitsStored", np.iinfo(raw_img.dtype).bits)
+    level_shift = (1 << (bit_depth - 1)) if level_shift_mode == "yes" else 0
     raw_hu = to_hu(raw_img, header)
     raw_window = window_image(raw_img, header, window_center, window_width)
     diff_range = window_width / 2
@@ -49,20 +57,27 @@ def run_experiment(
     for q_step in q_list:
         qh = q_step if q_high is None else q_high
 
+        t0 = time.perf_counter()
         test_codec_mvp(
             raw_img,
             q_step=q_step,
             q_high=qh,
             q_split=q_split,
             bit_depth=bit_depth,
+            entropy_method=entropy_method,
+            level_shift=level_shift,
         )
+        t1 = time.perf_counter()
 
         mic_path = os.path.join(out_dir, f"output_q{q_step}.mic")
         if os.path.exists("output.mic"):
             os.replace("output.mic", mic_path)
+        t2 = time.perf_counter()
 
         recon_img, header_info = load_compressed_file(mic_path, return_header=True)
+        t3 = time.perf_counter()
         rmse, psnr = compute_rmse_psnr(raw_img, recon_img, bit_depth)
+        t4 = time.perf_counter()
 
         size_bytes = os.path.getsize(mic_path)
         bpp = (size_bytes * 8) / (header_info["h"] * header_info["w"])
@@ -75,9 +90,12 @@ def run_experiment(
         diff = recon_hu - raw_hu
         diff_path = os.path.join(out_dir, f"diff_q{q_step}.jpg")
         plt.imsave(diff_path, diff, cmap="bwr", vmin=-diff_range, vmax=diff_range)
+        t5 = time.perf_counter()
 
         results.append(
             {
+                "method": header_info.get("method", entropy_method),
+                "level_shift": header_info.get("level_shift", level_shift),
                 "q_step": q_step,
                 "q_high": qh,
                 "q_split": q_split,
@@ -85,6 +103,11 @@ def run_experiment(
                 "bpp": bpp,
                 "rmse": rmse,
                 "psnr_db": psnr,
+                "t_encode_s": t1 - t0,
+                "t_move_s": t2 - t1,
+                "t_decode_s": t3 - t2,
+                "t_metric_s": t4 - t3,
+                "t_visual_s": t5 - t4,
             }
         )
 
@@ -93,6 +116,8 @@ def run_experiment(
         writer = csv.DictWriter(
             f,
             fieldnames=[
+                "method",
+                "level_shift",
                 "q_step",
                 "q_high",
                 "q_split",
@@ -100,6 +125,11 @@ def run_experiment(
                 "bpp",
                 "rmse",
                 "psnr_db",
+                "t_encode_s",
+                "t_move_s",
+                "t_decode_s",
+                "t_metric_s",
+                "t_visual_s",
             ],
         )
         writer.writeheader()
@@ -133,6 +163,18 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default="experiment3", help="Output directory")
     parser.add_argument("--window-center", type=float, default=40, help="CT window center")
     parser.add_argument("--window-width", type=float, default=400, help="CT window width")
+    parser.add_argument(
+        "--level-shift",
+        default="yes",
+        choices=["yes", "no"],
+        help="Level shift (yes=auto 2^(B-1), no=disabled)",
+    )
+    parser.add_argument(
+        "--entropy-method",
+        default="only_RLE",
+        choices=["only_RLE", "huffman_std", "huffman_adapt"],
+        help="Entropy coding method",
+    )
     args = parser.parse_args()
 
     results = run_experiment(
@@ -144,10 +186,14 @@ if __name__ == "__main__":
         args.out_dir,
         args.window_center,
         args.window_width,
+        args.entropy_method,
+        args.level_shift,
     )
 
     for r in results:
         print(
-            f"Q={r['q_step']}, size={r['size_bytes']} bytes, "
-            f"bpp={r['bpp']:.4f}, RMSE={r['rmse']:.4f}, PSNR={r['psnr_db']:.2f} dB"
+            f"method={r['method']}, shift={r['level_shift']}, Q={r['q_step']}, "
+            f"size={r['size_bytes']} bytes, bpp={r['bpp']:.4f}, "
+            f"RMSE={r['rmse']:.4f}, PSNR={r['psnr_db']:.2f} dB, "
+            f"t_enc={r['t_encode_s']:.3f}s, t_dec={r['t_decode_s']:.3f}s"
         )

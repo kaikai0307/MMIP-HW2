@@ -4,79 +4,60 @@ import numpy as np
 import matplotlib.pyplot as plt
 from bitstream import BitReader
 from codec import inverse_zigzag_scan, dequantize_band, block_idct
+from entropy_coding import EntropyCoder
 from readdcm import analyze_dicom_file, window_image
-
-def decode_rle_from_bits(reader):
-    """
-    從 BitReader 解析出一個 8x8 區塊的 ZigZag 係數陣列 (長度 64)
-    """
-    block_coeffs = np.zeros(64, dtype=int)
-    idx = 0
-    
-    while idx < 64:
-        # 1. 讀取 Run (4 bits)
-        run = reader.read(4)
-        
-        # 2. 讀取 Length (4 bits)
-        length = reader.read(4)
-        
-        # 檢查是否為 EOB / ZRL
-        if run == 0 and length == 0:
-            break # 後面全是 0，結束這個區塊
-        if run == 15 and length == 0:
-            idx += 16 # ZRL: 16 個 0
-            continue
-            
-        # 跳過 Run 個 0
-        idx += run
-        if idx >= 64: 
-            break
-            
-        # 3. 讀取數值
-        # 讀取 Sign (1 bit)
-        sign = reader.read(1)
-        # 讀取 Value (Length bits)
-        if length > 0:
-            abs_val = reader.read(length)
-        else:
-            abs_val = 0 # 理論上 Length=0 不會發生在這裡，防呆用
-            
-        # 還原正負號
-        val = -abs_val if sign == 1 else abs_val
-        
-        # 填入陣列
-        block_coeffs[idx] = val
-        idx += 1
-        
-    return block_coeffs
-
 
 def load_compressed_file(filepath, return_header=False):
     with open(filepath, 'rb') as f:
         file_bytes = f.read()
         
     # 1. 解析 Header (根據您 encode 時寫入的格式)
-    # v1: '>4sBHHBB' = Magic(4), Ver(1), H(2), W(2), Depth(1), Q(1)
-    # v2: '>4sBHHBBBB' = Magic(4), Ver(1), H(2), W(2), Depth(1), Qlow(1), Qhigh(1), Qsplit(1)
+    # v5: '>4sBHHBBBBBH' = Magic(4), Ver(1), H(2), W(2), Depth(1), Qlow(1), Qhigh(1), Qsplit(1), Method(1), LevelShift(2)
     header_prefix_size = struct.calcsize('>4sB')
     magic, ver = struct.unpack('>4sB', file_bytes[:header_prefix_size])
     if magic != b'MIPC':
         raise ValueError("Invalid file format!")
 
-    if ver >= 2:
-        header_size = struct.calcsize('>4sBHHBBBB')
+    method = 'only_RLE'
+    coder = None
+
+    if ver >= 5:
+        header_size = struct.calcsize('>4sBHHBBBBBH')
         header_data = file_bytes[:header_size]
-        magic, ver, h, w, depth, q_low, q_high, q_split = struct.unpack('>4sBHHBBBB', header_data)
+        magic, ver, h, w, depth, q_low, q_high, q_split, method_id, level_shift = struct.unpack('>4sBHHBBBBBH', header_data)
+    elif ver == 4:
+        header_size = struct.calcsize('>4sBHHBBBBB')
+        header_data = file_bytes[:header_size]
+        magic, ver, h, w, depth, q_low, q_high, q_split, method_id = struct.unpack('>4sBHHBBBBB', header_data)
+        level_shift = 0
     else:
-        header_size = struct.calcsize('>4sBHHBB')
-        header_data = file_bytes[:header_size]
-        magic, ver, h, w, depth, q_step = struct.unpack('>4sBHHBB', header_data)
-        q_low = q_step
-        q_high = q_step
-        q_split = 7
-    body_data = file_bytes[header_size:]
+        raise ValueError("Unsupported file version (expected v4/v5). Please re-encode.")
+
+    if ver >= 4:
+        lengths_end = header_size
+        if method_id == 1:
+            method = 'huffman_std'
+            coder = EntropyCoder.create_for_decoding(method)
+        elif method_id == 2:
+            method = 'huffman_adapt'
+            lengths_start = header_size
+            lengths_mid = lengths_start + 256
+            lengths_end = lengths_mid + 16
+            ac_lengths = list(file_bytes[lengths_start:lengths_mid])
+            dc_lengths = list(file_bytes[lengths_mid:lengths_end])
+            coder = EntropyCoder.create_for_decoding(
+                method,
+                lengths={"ac": ac_lengths, "dc": dc_lengths},
+            )
+        body_data = file_bytes[lengths_end:]
     
-    print(f"Header Info -> Size: {h}x{w}, Depth: {depth}, Qlow: {q_low}, Qhigh: {q_high}, Qsplit: {q_split}")
+    if coder is None:
+        coder = EntropyCoder.create_for_decoding(method)
+    coder.reset_state()
+    print(
+        f"Header Info -> Size: {h}x{w}, Depth: {depth}, Qlow: {q_low}, "
+        f"Qhigh: {q_high}, Qsplit: {q_split}, Method: {method}, Shift: {level_shift}"
+    )
     
     # 2. 準備解碼
     reader = BitReader(body_data)
@@ -93,7 +74,7 @@ def load_compressed_file(filepath, return_header=False):
     for r in range(0, pad_h, 8):
         for c in range(0, pad_w, 8):
             # A. 從 bitstream 拉出係數
-            zigzag = decode_rle_from_bits(reader)
+            zigzag = coder.decode_block(reader)
             
             # B. Inverse ZigZag
             q_coeff = inverse_zigzag_scan(zigzag)
@@ -103,6 +84,8 @@ def load_compressed_file(filepath, return_header=False):
             
             # D. IDCT
             block = block_idct(dct_coeff)
+            if level_shift:
+                block = block + level_shift
             
             # E. 填回影像 (注意邊界檢查，不要寫出界)
             # 這裡只填入有效範圍
@@ -118,6 +101,8 @@ def load_compressed_file(filepath, return_header=False):
             "q_low": q_low,
             "q_high": q_high,
             "q_split": q_split,
+            "method": method,
+            "level_shift": level_shift,
             "ver": ver,
         }
         return reconstructed_img, header_info

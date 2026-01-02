@@ -96,12 +96,22 @@ def dequantize_band(q_coeffs, q_low, q_high, split=4):
     q_mat = build_q_matrix(q_low, q_high, split)
     return q_coeffs * q_mat
 
-def test_codec_mvp(original_image, q_step=20, q_high=None, q_split=4, bit_depth=None):
+def test_codec_mvp(
+    original_image,
+    q_step=20,
+    q_high=None,
+    q_split=4,
+    bit_depth=None,
+    entropy_method='only_RLE',
+    level_shift=None,
+):
     q_low = q_step
     if q_high is None:
         q_high = q_step
     if bit_depth is None:
         bit_depth = np.iinfo(original_image.dtype).bits
+    if level_shift is None:
+        level_shift = 1 << (bit_depth - 1)
     # 1. Padding
     padded_img, orig_h, orig_w = pad_image(original_image)
     h, w = padded_img.shape
@@ -109,13 +119,16 @@ def test_codec_mvp(original_image, q_step=20, q_high=None, q_split=4, bit_depth=
     # 準備容器
     reconstructed_img = np.zeros((h, w))
     all_blocks_rle = []
+    prev_dc = 0
     
     # 2. 逐區塊處理 (Block Processing)
     # 這裡用雙層迴圈示範原理，之後可用 view_as_blocks 加速
     for r in range(0, h, 8):
         for c in range(0, w, 8):
             # 取出 8x8 區塊
-            block = padded_img[r:r+8, c:c+8]
+            block = padded_img[r:r+8, c:c+8].astype(np.float64)
+            if level_shift:
+                block = block - level_shift
             
             # --- Encoder 端 ---
             # DCT 變換
@@ -125,8 +138,12 @@ def test_codec_mvp(original_image, q_step=20, q_high=None, q_split=4, bit_depth=
             
 
             zigzag = zigzag_scan(q_coeff)
-            rle = encode_block_rle(zigzag)
-            all_blocks_rle.append(rle)
+            dc = int(zigzag[0])
+            dc_diff = dc - prev_dc
+            prev_dc = dc
+
+            rle = encode_block_rle_ac(zigzag)
+            all_blocks_rle.append((dc_diff, rle))
             
             
             # --- Decoder 端 ---
@@ -134,6 +151,8 @@ def test_codec_mvp(original_image, q_step=20, q_high=None, q_split=4, bit_depth=
             rec_coeff = dequantize_band(q_coeff, q_low, q_high, q_split)
             # 反 DCT
             rec_block = block_idct(rec_coeff)
+            if level_shift:
+                rec_block = rec_block + level_shift
             
             # 放回大圖
             reconstructed_img[r:r+8, c:c+8] = rec_block
@@ -149,8 +168,9 @@ def test_codec_mvp(original_image, q_step=20, q_high=None, q_split=4, bit_depth=
         'q_low': q_low,
         'q_high': q_high,
         'q_split': q_split,
+        'level_shift': level_shift,
     }
-    save_compressed_file("output.mic", header_info, all_blocks_rle)
+    save_compressed_file("output.mic", header_info, all_blocks_rle, method=entropy_method)
     ##.mic (Medical Image Codec)
     
     print(f"Original Size: {original_bytes / 1024:.2f} KB")
@@ -215,6 +235,26 @@ def encode_block_rle(zigzag_coeff):
     
     return rle_symbols
 
+def encode_block_rle_ac(zigzag_coeff):
+    """
+    只針對 AC 係數做 RLE (跳過 DC)
+    """
+    rle_symbols = []
+    run_zeros = 0
+
+    for i in range(1, len(zigzag_coeff)):
+        val = zigzag_coeff[i]
+        if val == 0:
+            run_zeros += 1
+        else:
+            rle_symbols.append((run_zeros, val))
+            run_zeros = 0
+
+    if run_zeros > 0:
+        rle_symbols.append((0, 0))
+
+    return rle_symbols
+
 def decode_block_rle(rle_symbols):
     """
     將 RLE 符號還原回 64 個係數
@@ -255,7 +295,13 @@ def estimate_compressed_size(image_rle_data):
     - Value (數值): 平均用 6 bits (這取決於數值大小)
     """
     total_bits = 0
-    for block_symbols in image_rle_data:
+    for dc_diff, block_symbols in image_rle_data:
+        dc_len = abs(int(dc_diff)).bit_length()
+        if dc_len > 0:
+            total_bits += (4 + 1 + dc_len)  # DC length + sign + value
+        else:
+            total_bits += 4
+
         for run, val in block_symbols:
             # 每個 symbol 大約花費:
             # run: 4 bits
@@ -279,7 +325,15 @@ if __name__ == "__main__":
     filepath = "/ssd7/jiakai/multimedia_hw2/CT_COLONOGRAPHY/1.3.6.1.4.1.9328.50.4.0001/01-01-2000-1-Abdomen24ACRINColoIRB2415-04 Adult-0.4.1/3.000000-Colosupine  1.0  B30f-4.563/1-010.dcm"
     raw_img, header = analyze_dicom_file(filepath)
     bit_depth = getattr(header, 'BitsStored', np.iinfo(raw_img.dtype).bits)
-    decoded_img = test_codec_mvp(raw_img, q_step=50, q_high=50, q_split=4, bit_depth=bit_depth)
+    level_shift = 1 << (bit_depth - 1)
+    decoded_img = test_codec_mvp(
+        raw_img,
+        q_step=50,
+        q_high=50,
+        q_split=4,
+        bit_depth=bit_depth,
+        level_shift=level_shift,
+    )
 
     # 計算 RMSE
     mse = np.mean((raw_img - decoded_img) ** 2)
