@@ -1,18 +1,102 @@
 # decode.py (建議新建這個檔案)
+import argparse
 import struct
 import numpy as np
-import matplotlib.pyplot as plt
+import pydicom
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import generate_uid, ExplicitVRLittleEndian, SecondaryCaptureImageStorage
+
 from bitstream import BitReader
-from codec import inverse_zigzag_scan, dequantize_band, block_idct
+from encode import inverse_zigzag_scan, dequantize_band, block_idct
 from entropy_coding import EntropyCoder
-from readdcm import analyze_dicom_file, window_image
+from readdcm import analyze_dicom_file
+
+
+def _infer_pixel_repr(level_shift, array):
+    if level_shift == 0:
+        return 1
+    if np.min(array) < 0:
+        return 1
+    return 0
+
+
+def _build_minimal_dicom(rows, cols, header_info):
+    meta = FileMetaDataset()
+    meta.FileMetaInformationVersion = b"\x00\x01"
+    meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+    meta.MediaStorageSOPInstanceUID = generate_uid()
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+    ds = FileDataset("", {}, file_meta=meta, preamble=b"\0" * 128)
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
+    ds.SOPClassUID = SecondaryCaptureImageStorage
+    ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+    ds.StudyInstanceUID = generate_uid()
+    ds.SeriesInstanceUID = generate_uid()
+    ds.Modality = "OT"
+    ds.PatientName = "Anon"
+    ds.PatientID = "000000"
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.Rows = rows
+    ds.Columns = cols
+
+    bit_depth = int(header_info.get("depth", 16))
+    bits_allocated = 16 if bit_depth > 8 else 8
+    ds.BitsAllocated = bits_allocated
+    ds.BitsStored = bit_depth
+    ds.HighBit = bit_depth - 1
+    pixel_repr = _infer_pixel_repr(header_info.get("level_shift", 0), np.zeros((1, 1)))
+    ds.PixelRepresentation = pixel_repr
+
+    ds.RescaleSlope = float(header_info.get("rescale_slope", 1.0))
+    ds.RescaleIntercept = float(header_info.get("rescale_intercept", 0.0))
+    ds.WindowCenter = float(header_info.get("window_center", 40.0))
+    ds.WindowWidth = float(header_info.get("window_width", 400.0))
+    return ds
+
+
+def save_recon_dicom(path, array, header_info, template_path=None):
+    if template_path:
+        ds = pydicom.dcmread(template_path)
+    else:
+        rows, cols = array.shape
+        ds = _build_minimal_dicom(rows, cols, header_info)
+    rows, cols = array.shape
+    ds.Rows = rows
+    ds.Columns = cols
+
+    bit_depth = int(getattr(ds, "BitsStored", 16))
+    pixel_repr = int(getattr(ds, "PixelRepresentation", _infer_pixel_repr(header_info.get("level_shift", 0), array)))
+    if pixel_repr == 1:
+        min_val = -(1 << (bit_depth - 1))
+        max_val = (1 << (bit_depth - 1)) - 1
+        dtype = np.int16 if getattr(ds, "BitsAllocated", 16) > 8 else np.int8
+    else:
+        min_val = 0
+        max_val = (1 << bit_depth) - 1
+        dtype = np.uint16 if getattr(ds, "BitsAllocated", 16) > 8 else np.uint8
+
+    recon = np.rint(array).astype(np.int64)
+    recon = np.clip(recon, min_val, max_val).astype(dtype)
+    ds.PixelData = recon.tobytes()
+
+    new_uid = generate_uid()
+    ds.SOPInstanceUID = new_uid
+    if hasattr(ds, "file_meta") and ds.file_meta is not None:
+        ds.file_meta.MediaStorageSOPInstanceUID = new_uid
+
+    ds.save_as(path)
+    return path
 
 def load_compressed_file(filepath, return_header=False):
     with open(filepath, 'rb') as f:
         file_bytes = f.read()
         
     # 1. 解析 Header (根據您 encode 時寫入的格式)
-    # v5: '>4sBHHBBBBBH' = Magic(4), Ver(1), H(2), W(2), Depth(1), Qlow(1), Qhigh(1), Qsplit(1), Method(1), LevelShift(2)
+    # v6: '>4sBHHBBBBBHffff' = Magic(4), Ver(1), H(2), W(2), Depth(1), Qlow(1), Qhigh(1), Qsplit(1), Method(1), LevelShift(2),
+    #       RescaleSlope(4), RescaleIntercept(4), WindowCenter(4), WindowWidth(4)
     header_prefix_size = struct.calcsize('>4sB')
     magic, ver = struct.unpack('>4sB', file_bytes[:header_prefix_size])
     if magic != b'MIPC':
@@ -21,17 +105,44 @@ def load_compressed_file(filepath, return_header=False):
     method = 'only_RLE'
     coder = None
 
-    if ver >= 5:
+    if ver >= 6:
+        header_size = struct.calcsize('>4sBHHBBBBBHffff')
+        header_data = file_bytes[:header_size]
+        (
+            magic,
+            ver,
+            h,
+            w,
+            depth,
+            q_low,
+            q_high,
+            q_split,
+            method_id,
+            level_shift,
+            rescale_slope,
+            rescale_intercept,
+            window_center,
+            window_width,
+        ) = struct.unpack('>4sBHHBBBBBHffff', header_data)
+    elif ver == 5:
         header_size = struct.calcsize('>4sBHHBBBBBH')
         header_data = file_bytes[:header_size]
         magic, ver, h, w, depth, q_low, q_high, q_split, method_id, level_shift = struct.unpack('>4sBHHBBBBBH', header_data)
+        rescale_slope = None
+        rescale_intercept = None
+        window_center = None
+        window_width = None
     elif ver == 4:
         header_size = struct.calcsize('>4sBHHBBBBB')
         header_data = file_bytes[:header_size]
         magic, ver, h, w, depth, q_low, q_high, q_split, method_id = struct.unpack('>4sBHHBBBBB', header_data)
         level_shift = 0
+        rescale_slope = None
+        rescale_intercept = None
+        window_center = None
+        window_width = None
     else:
-        raise ValueError("Unsupported file version (expected v4/v5). Please re-encode.")
+        raise ValueError("Unsupported file version (expected v4/v5/v6). Please re-encode.")
 
     if ver >= 4:
         lengths_end = header_size
@@ -103,6 +214,10 @@ def load_compressed_file(filepath, return_header=False):
             "q_split": q_split,
             "method": method,
             "level_shift": level_shift,
+            "rescale_slope": rescale_slope,
+            "rescale_intercept": rescale_intercept,
+            "window_center": window_center,
+            "window_width": window_width,
             "ver": ver,
         }
         return reconstructed_img, header_info
@@ -124,25 +239,25 @@ def compute_rmse_psnr(original_img, reconstructed_img, bit_depth):
         psnr = 20 * np.log10(max_val / rmse)
     return rmse, psnr
 
+
+def decode_cmd(args):
+    img_recon, header_info = load_compressed_file(args.input, return_header=True)
+    output_path = args.output
+    if not output_path.lower().endswith(".dcm"):
+        output_path = f"{output_path}.dcm"
+    save_recon_dicom(output_path, img_recon, header_info, args.dicom or None)
+    print(f"Saved decoded DICOM: {output_path}")
+
+    if args.dicom:
+        raw_img, header = analyze_dicom_file(args.dicom)
+        rmse, psnr = compute_rmse_psnr(raw_img, img_recon, header_info["depth"])
+        print(f"RMSE: {rmse:.4f}")
+        print(f"PSNR: {psnr:.2f} dB (MAX=2^{header_info['depth']}-1)")
+
 if __name__ == "__main__":
-
-    # --- 測試解碼 ---
-    filepath = "output.mic"
-    img_recon, header_info = load_compressed_file(filepath, return_header=True)
-
-    # --- RMSE / PSNR ---
-    # 請填入原始 DICOM 檔案路徑以計算 RMSE/PSNR
-    original_filepath = "/ssd7/jiakai/multimedia_hw2/CT_COLONOGRAPHY/1.3.6.1.4.1.9328.50.4.0001/01-01-2000-1-Abdomen24ACRINColoIRB2415-04 Adult-0.4.1/3.000000-Colosupine  1.0  B30f-4.563/1-010.dcm"
-    raw_img, header = analyze_dicom_file(original_filepath)
-    rmse, psnr = compute_rmse_psnr(raw_img, img_recon, header_info["depth"])
-    print(f"RMSE: {rmse:.4f}")
-    print(f"PSNR: {psnr:.2f} dB (MAX=2^{header_info['depth']}-1)")
-
-    # --- 顯示結果 (Windowed) ---
-    window_center = 40
-    window_width = 400
-    recon_window = window_image(img_recon, header, window_center, window_width)
-    plt.imshow(recon_window, cmap="gray", vmin=0, vmax=255)
-    plt.title("Reconstructed Image (Windowed)")
-    plt.show()
-    plt.imsave("reconstructed_image_window.jpg", recon_window, cmap="gray", vmin=0, vmax=255)
+    parser = argparse.ArgumentParser(description="Decode .mic to DICOM")
+    parser.add_argument("--input", default="output.mic", help="Path to .mic file")
+    parser.add_argument("--output", default="recon.dcm", help="Output DICOM path")
+    parser.add_argument("--dicom", default="", help="Optional reference DICOM for metadata/RMSE")
+    args = parser.parse_args()
+    decode_cmd(args)

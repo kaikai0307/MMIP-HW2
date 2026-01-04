@@ -102,9 +102,14 @@ def save_compressed_file(filepath, header_info, rle_data, method='only_RLE'):
 
     method_id = method_map[method_alias]
 
-    header_bytes = struct.pack('>4sBHHBBBBBH', 
+    rescale_slope = float(header_info.get('rescale_slope', 1.0))
+    rescale_intercept = float(header_info.get('rescale_intercept', 0.0))
+    window_center = float(header_info.get('window_center', 40.0))
+    window_width = float(header_info.get('window_width', 400.0))
+
+    header_bytes = struct.pack('>4sBHHBBBBBHffff', 
                                b'MIPC',      # Magic
-                               5,            # Version
+                               6,            # Version
                                header_info['h'], 
                                header_info['w'], 
                                header_info['depth'], 
@@ -112,7 +117,11 @@ def save_compressed_file(filepath, header_info, rle_data, method='only_RLE'):
                                q_high,
                                q_split,
                                method_id,
-                               level_shift)
+                               level_shift,
+                               rescale_slope,
+                               rescale_intercept,
+                               window_center,
+                               window_width)
     if method_id == 2:
         header_bytes += bytes(coder.lengths_ac)
         header_bytes += bytes(coder.lengths_dc)

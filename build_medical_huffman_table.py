@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pydicom
 
-from codec import pad_image, block_dct, quantize_band, zigzag_scan, encode_block_rle_ac
+from encode import pad_image, block_dct, quantize_band, zigzag_scan, encode_block_rle_ac
 from entropy_coding import _build_huffman_from_freqs
 
 

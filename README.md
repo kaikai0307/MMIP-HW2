@@ -6,11 +6,13 @@ around CT DICOM images and supports fixed low/high frequency quantization.
 
 ## Files
 
-- `codec.py`: DCT/IDCT, quantization, zigzag, RLE encoding, and encode driver.
+- `codec.py`: CLI entry for encode/decode.
 - `bitstream.py`: bitstream I/O, header layout, and file save logic.
-- `decode.py`: bitstream decoding, reconstruction, RMSE/PSNR, and display.
+- `decode.py`: bitstream decoding, reconstruction, RMSE/PSNR, and DICOM output.
 - `entropy_coding.py`: entropy coding (RLE + Huffman) implementation.
-- `test.py`: experiment runner for Q-halving and RD curves.
+- `encode.py`: encoding core (DCT/quantization/zigzag/RLE) + encode-only CLI.
+- `test/q_ratio_test.py`: RD curve comparison (split vs single quantization).
+- `test/hu_error_stats.py`: HU-binned error stats and plots.
 - `build_medical_huffman_table.py`: build a fixed Huffman table from dataset.
 - `readdcm.py`: DICOM reading and windowed display utilities.
 
@@ -29,38 +31,42 @@ around CT DICOM images and supports fixed low/high frequency quantization.
 
 ### Encode / Decode (single file)
 
-1. Edit the DICOM path in `codec.py` or pass your own path.
-2. Run encode:
+Use `./test_data/1-010.dcm` for the test input.
+
+1. Run encode:
 ```
-~/miniconda3/envs/codec/bin/python codec.py
+python codec.py encode --input ./test_data/1-010.dcm --output output.mic --quality 50
 ```
-3. Run decode:
+2. Run decode:
 ```
-~/miniconda3/envs/codec/bin/python decode.py
+python codec.py decode --input output.mic --output recon.dcm
 ```
 
-### Experiment 3: Q Halving RD Curve
+3. Visualize (combined JPG):
+```
+python readdcm.py --inputs ./test_data/1-010.dcm recon.dcm
+```
+
+Quality (`--quality`) is the quantization step (Q). Larger values give more
+compression but lower visual quality.
+
+### Experiment: RD Curve Comparison
 
 ```
-~/miniconda3/envs/codec/bin/python test.py --entropy-method only_RLE
+python test/q_ratio_test.py --entropy-method huffman_adapt
 ```
 
-Outputs are written under `experiment3/<method>/`:
-
-- `rd_curve.csv` / `rd_curve.jpg`
-- `recon_q*_window.jpg`
-- `diff_q*.jpg`
-
-Optional level shift:
+Usage options:
 ```
-~/miniconda3/envs/codec/bin/python test.py --level-shift yes
-~/miniconda3/envs/codec/bin/python test.py --level-shift no
+python test/q_ratio_test.py --q-high-list 80,60,40,30 --q-high-ratio 2 --entropy-method huffman_adapt
+python test/q_ratio_test.py --q-low-list 80,60,40,30 --entropy-method huffman_adapt
 ```
+
 
 ### Entropy Coding Methods
 
 - `only_RLE`: RLE with fixed fields.
-- `huffman_std`: JPEG standard AC table (may fall back if size>10 appears).
+- `huffman_std`: fixed medical table (with fallback when out-of-range).
 - `huffman_adapt`: dataset-adaptive Huffman table.
 
 ## Build a Fixed "Medical" Huffman Table
@@ -69,12 +75,12 @@ This scans all DICOM files under CT_COLONOGRAPHY (excluding topo)
 and prints a fixed Huffman length table you can hardcode.
 
 ```
-~/miniconda3/envs/codec/bin/python build_medical_huffman_table.py
+python build_medical_huffman_table.py
 ```
 
 For a faster approximate table:
 ```
-~/miniconda3/envs/codec/bin/python build_medical_huffman_table.py --max-files 200
+python build_medical_huffman_table.py --max-files 200
 ```
 
 ## Notes
@@ -83,4 +89,4 @@ For a faster approximate table:
   different acquisition geometry and intensity characteristics, which
   can skew symbol statistics for the main CT slices.
 - PSNR uses MAX = 2^B - 1, where B is the DICOM bit depth.
-- Windowed display is aligned across `readdcm.py`, `test.py`, and `decode.py`.
+- Windowed display and combined JPG output are handled in `readdcm.py`.

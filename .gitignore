@@ -3,3 +3,6 @@ experiment3/
 CT_COLONOGRAPHY/
 __pycache__/
 .gitignore
+output.mic
+recon.dcm
+test/
