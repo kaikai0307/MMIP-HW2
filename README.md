@@ -90,3 +90,5 @@ python build_medical_huffman_table.py --max-files 200
   can skew symbol statistics for the main CT slices.
 - PSNR uses MAX = 2^B - 1, where B is the DICOM bit depth.
 - Windowed display and combined JPG output are handled in `readdcm.py`.
+- The `.mic` extension stands for **Medical Image Codec**, used to label the
+  custom compressed bitstream format in this project.
