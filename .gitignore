@@ -5,4 +5,3 @@ __pycache__/
 .gitignore
 output.mic
 recon.dcm
-test/
