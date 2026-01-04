@@ -322,14 +322,15 @@ def estimate_compressed_size(image_rle_data):
 if __name__ == "__main__":
     # --- 執行測試 ---
     # 假設 raw_img 是您上一步讀出來的 CT 數據
-    filepath = "/ssd7/jiakai/multimedia_hw2/CT_COLONOGRAPHY/1.3.6.1.4.1.9328.50.4.0001/01-01-2000-1-Abdomen24ACRINColoIRB2415-04 Adult-0.4.1/3.000000-Colosupine  1.0  B30f-4.563/1-010.dcm"
+    # filepath = "/ssd7/jiakai/multimedia_hw2/CT_COLONOGRAPHY/1.3.6.1.4.1.9328.50.4.0001/01-01-2000-1-Abdomen24ACRINColoIRB2415-04 Adult-0.4.1/3.000000-Colosupine  1.0  B30f-4.563/1-010.dcm"
+    filepath = "/ssd7/jiakai/multimedia_hw2/CT_COLONOGRAPHY/I59"
     raw_img, header = analyze_dicom_file(filepath)
     bit_depth = getattr(header, 'BitsStored', np.iinfo(raw_img.dtype).bits)
     level_shift = 1 << (bit_depth - 1)
     decoded_img = test_codec_mvp(
         raw_img,
-        q_step=50,
-        q_high=50,
+        q_step=10,
+        q_high=10,
         q_split=4,
         bit_depth=bit_depth,
         level_shift=level_shift,
